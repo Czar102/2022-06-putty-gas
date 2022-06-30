@@ -95,6 +95,18 @@ contract PuttyV2 is PuttyV2Nft, EIP712("Putty", "2.0"), ERC721TokenReceiver, Own
     bytes32 public constant ERC20ASSET_TYPE_HASH =
         keccak256(abi.encodePacked("ERC20Asset(address token,uint256 tokenAmount)"));
 
+    // /**
+    //     @dev ERC721Asset type hash used for EIP-712 encoding.
+    //  */
+    // bytes32 public constant ERC721ASSET_ARRAY_TYPE_HASH =
+    //     keccak256(abi.encodePacked("ERC721Asset(address token,uint256 tokenId)"));
+
+    // /**
+    //     @dev ERC20Asset type hash used for EIP-712 encoding.
+    //  */
+    // bytes32 public constant ERC20ASSET_ARRAY_TYPE_HASH =
+    //     keccak256(abi.encodePacked("ERC20Asset(address token,uint256 tokenAmount)"));
+
     /**
         @dev ERC721Asset type hash used for EIP-712 encoding.
      */
@@ -681,12 +693,12 @@ contract PuttyV2 is PuttyV2Nft, EIP712("Putty", "2.0"), ERC721TokenReceiver, Own
         @return orderHash The hash of the opposite order.
      */
     function hashOppositeOrder(Order memory order) public view returns (bytes32 orderHash) {
-        // use decode/encode to get a copy instead of reference
-        Order memory oppositeOrder = abi.decode(abi.encode(order), (Order));
+        bool isLong = order.isLong;
 
         // get the opposite side of the order (short/long)
-        oppositeOrder.isLong = !order.isLong;
-        orderHash = hashOrder(oppositeOrder);
+        order.isLong = !isLong;
+        orderHash = hashOrder(order);
+		order.isLong = isLong;
     }
 
     /* ~~~ EIP-712 HELPERS ~~~ */
@@ -697,24 +709,38 @@ contract PuttyV2 is PuttyV2Nft, EIP712("Putty", "2.0"), ERC721TokenReceiver, Own
         @return orderHash The eip-712 compliant hash of the order.
      */
     function hashOrder(Order memory order) public view returns (bytes32 orderHash) {
-        orderHash = keccak256(
-            abi.encode(
-                ORDER_TYPE_HASH,
-                order.maker,
-                order.isCall,
-                order.isLong,
-                order.baseAsset,
-                order.strike,
-                order.premium,
-                order.duration,
-                order.expiration,
-                order.nonce,
-                keccak256(abi.encodePacked(order.whitelist)),
-                keccak256(abi.encodePacked(order.floorTokens)),
-                keccak256(encodeERC20Assets(order.erc20Assets)),
-                keccak256(encodeERC721Assets(order.erc721Assets))
-            )
-        );
+		bytes32 orderTypeHash = ORDER_TYPE_HASH;
+		bytes32 ERC20Hash = keccak256(encodeERC20Assets(order.erc20Assets));
+		bytes32 ERC721Hash = keccak256(encodeERC721Assets(order.erc721Assets));
+		assembly {
+			let start := sub(order, 32)
+			let prevBefore := mload(start)
+			mstore(start, orderTypeHash)
+
+			let ptr := add(order, 288)
+			let ptr9 := mload(ptr)
+			mstore(ptr, keccak256(add(ptr9, 32), mul(mload(ptr9), 32)))
+
+			ptr := add(order, 320)
+			let ptr10 := mload(ptr)
+			mstore(ptr, keccak256(add(ptr10, 32), mul(mload(ptr10), 32)))
+
+			ptr := add(order, 352)
+			let ptr11 := mload(ptr)
+			mstore(ptr, ERC20Hash)
+
+			ptr := add(order, 384)
+			let ptr12 := mload(ptr)
+			mstore(ptr, ERC721Hash)
+
+			orderHash := keccak256(start, 448)
+
+			mstore(ptr, ptr12)
+			mstore(add(order, 352), ptr11)
+			mstore(add(order, 320), ptr10)
+			mstore(add(order, 288), ptr9)
+			mstore(start, prevBefore)
+		}
 
         orderHash = _hashTypedDataV4(orderHash);
     }
@@ -724,13 +750,13 @@ contract PuttyV2 is PuttyV2Nft, EIP712("Putty", "2.0"), ERC721TokenReceiver, Own
         @param arr Array of erc20 assets to hash.
         @return encoded The eip-712 encoded array of erc20 assets.
      */
-    function encodeERC20Assets(ERC20Asset[] memory arr) public pure returns (bytes memory encoded) {
-        for (uint256 i = 0; i < arr.length; i++) {
-            encoded = abi.encodePacked(
-                encoded,
-                keccak256(abi.encode(ERC20ASSET_TYPE_HASH, arr[i].token, arr[i].tokenAmount))
-            );
-        }
+    function encodeERC20Assets(ERC20Asset[] memory arr) public pure returns (bytes memory) {
+		uint256 ptr;
+		assembly {
+			ptr := arr
+		}
+
+		return _encode64ByteStructWithTypeHash(ptr, ERC20ASSET_TYPE_HASH);
     }
 
     /**
@@ -739,13 +765,44 @@ contract PuttyV2 is PuttyV2Nft, EIP712("Putty", "2.0"), ERC721TokenReceiver, Own
         @return encoded The eip-712 encoded array of erc721 assets.
      */
     function encodeERC721Assets(ERC721Asset[] memory arr) public pure returns (bytes memory encoded) {
-        for (uint256 i = 0; i < arr.length; i++) {
-            encoded = abi.encodePacked(
-                encoded,
-                keccak256(abi.encode(ERC721ASSET_TYPE_HASH, arr[i].token, arr[i].tokenId))
-            );
-        }
+		uint256 ptr;
+		assembly {
+			ptr := arr
+		}
+
+		return _encode64ByteStructWithTypeHash(ptr, ERC721ASSET_TYPE_HASH);
     }
+
+	function _encode64ByteStructWithTypeHash(uint256 arr, bytes32 typeHash) pure internal returns (bytes memory encoded) {
+		assembly {
+			// construct an array
+			encoded := mload(0x40)
+			let size := shl(5, mload(arr))
+			let to := add(encoded, 32)
+			mstore(0x40, add(to, size))
+			mstore(encoded, size)
+
+			for {
+				let ptr := arr
+				let max := add(arr, shl(1, size))
+			} lt(ptr, max) {
+				ptr := add(ptr, 64)
+				to := add(to, 32)
+			} {
+				// load previous value
+				let prev := mload(ptr)
+
+				// prepend order with the typehash
+				mstore(ptr, typeHash)
+
+				// save hash to the encoded array
+				mstore(to, keccak256(ptr, 96))
+
+				// restore value
+				mstore(ptr, prev)
+			}
+		}
+	}
 
     /**
         @return The domain seperator used when calculating the eip-712 hash.
